@@ -1,0 +1,133 @@
+name: release on multiple platforms
+
+on:
+  push:
+    tags:
+      - "v*.*.*"  # Trigger on SEMVER tags like "v1.2.3"
+  
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Set fail-fast to false to ensure that feedback is delivered for all matrix combinations. Consider changing this to true when your workflow is stable.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+        build_type: [Release]
+        c_compiler: [clang]
+        include:
+        - os: ubuntu-22.04
+          profile: ubuntu-22.04-x86_64-clang-14-release
+        - os: macos-14
+          profile: macos-14-armv8-apple_clang-15-release
+        - os: windows-2022
+          profile: windows-2022-x86_64-clang-18-release
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Extract version from Git tag
+      shell: bash
+      run: |
+        TAG_VERSION="${GITHUB_REF#refs/tags/}"
+        echo "TAG_VERSION=${TAG_VERSION}" >> $GITHUB_ENV
+
+    - name: Check VERSION file
+      shell: bash
+      run: |
+        VERSION_FROM_FILE=$(cat VERSION)
+        if [ "$VERSION_FROM_FILE" != "$TAG_VERSION" ]; then
+        echo "ERROR: VERSION file ($VERSION_FROM_FILE) does not match Git tag ($TAG_VERSION)"
+        exit 1
+        else
+        echo "VERSION file is consistent with Git tag"
+        fi
+        echo "VERSION_FROM_FILE=${VERSION_FROM_FILE#v}" >> $GITHUB_ENV
+
+    - name: Set reusable strings
+      # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
+      id: strings
+      shell: bash
+      run: |
+        echo "build-output-dir=${{ github.workspace }}/build/Release" >> "$GITHUB_OUTPUT"
+        echo "version=$VERSION_FROM_FILE" >> "$GITHUB_OUTPUT"
+    - uses: actions/setup-python@v5
+      with:
+          python-version: '3.13'
+          cache: 'pip' # caching pip dependencies
+    - run: pip install -r requirements.txt
+    - name : Install Dependencies Conan
+      run: | 
+        conan profile detect
+        conan install . -pr ${{ github.workspace }}/profiles/${{ matrix.profile }} --build=missing
+    - name: CMake configuration
+      run: |
+            cmake -B ${{ steps.strings.outputs.build-output-dir}} --preset conan-release
+    - name: Build
+      run: |
+            cmake --build ${{ steps.strings.outputs.build-output-dir }} 
+    - name: Test
+      working-directory: ${{ steps.strings.outputs.build-output-dir }}
+      run: ctest --test-dir ${{ steps.strings.outputs.build-output-dir}} 
+    - name: Install with CMake
+      run: cmake --install ${{ steps.strings.outputs.build-output-dir}} --prefix install_dir
+    - name: Upload microemu artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: microemu-${{ steps.strings.outputs.version}}-${{ matrix.profile }}
+        path: install_dir/bin
+    - name: Upload libmicroemu artifact
+      uses: actions/upload-artifact@v4
+      with:
+          name: libmicroemu-${{ steps.strings.outputs.version}}-${{ matrix.profile }}
+          path: |
+            install_dir/
+            !install_dir/bin/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+        - name: Check out the code
+          uses: actions/checkout@v4    
+        - name: Read version from VERSION file
+          shell: bash
+          run: |
+            VERSION_FROM_FILE=$(cat VERSION)
+            echo "VERSION_FROM_FILE=${VERSION_FROM_FILE#v}" >> $GITHUB_ENV
+        - name: Set reusable strings
+          id: strings
+          shell: bash
+          run: |
+            echo "version=$VERSION_FROM_FILE" >> "$GITHUB_OUTPUT"
+        - name: Download Artifacts
+          uses: actions/download-artifact@v4
+          with:
+            path: downloaded-artifacts  # Download all artifacts into a specific directory 
+        - name: Display structure of downloaded files
+          run: ls -R downloaded-artifacts 
+        - name: Iterate Over Directories
+          run: |
+            mkdir -p compressed  # Create a directory to store compressed artifacts
+            
+            # Navigate to the directory with the downloaded artifacts
+            cd downloaded-artifacts
+            
+            # Iterate over all directories
+            for dir in */ ; do
+              echo "Directory: $dir"
+
+              # Hack: Find and set executable permissions on files that need it
+              find "$dir" -type f -name "microemu" -exec chmod +x {} \;
+
+              # Compress each directory into a separate ZIP archive
+              zip -r "../compressed/${dir%/}.zip" "$dir"
+            done
+            
+        - name: Create GitHub Release
+          uses: softprops/action-gh-release@v2
+          with:
+            files: compressed/*  # Attach all downloaded artifacts to the release
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
