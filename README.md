@@ -1,1 +1,1 @@
-# C++ example application
+# Conan template 
